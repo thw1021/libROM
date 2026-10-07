@@ -11,6 +11,8 @@
 #   5. googletest 1.14.0                         -> dependencies/googletest/install
 #   6. libROM full shared build  (MFEM + examples + unit tests) -> build/
 #   7. libROM PIC static core build (for linking into SU2 shared objects) -> build_pic/
+#   7b. SU2 HDF5 version alignment of build_pic (conditional; install_su2.sh
+#       also performs this during the SU2 build -- see Step 8b)
 #   8. Environment setup script                  -> librom_env.sh
 #
 # Every dependency step is skipped when its artifact already exists, so the
@@ -28,9 +30,12 @@ DEPS_DIR="${LIBROM_DIR}/dependencies"
 BUILD_DIR="${LIBROM_DIR}/build"          # full shared build (MFEM + examples + tests)
 BUILD_PIC_DIR="${LIBROM_DIR}/build_pic"  # PIC static core build (SU2)
 ENV_FILE="${LIBROM_DIR}/librom_env.sh"
-NPROC=$(nproc)
+NPROC="${LIBROM_JOBS:-$(nproc)}"   # override with LIBROM_JOBS (SU2 convention: compile with <= 10 cores)
 
 # HDF5 built with MPI support is required (HDFDatabaseMPIO uses H5Pset_fapl_mpio).
+# SU2 additionally requires the PIC static core (build_pic) to be compiled
+# against the SAME HDF5 that SU2's CGNS vendors (libsu2hdf5.a, 1.12.1):
+# HDF5's H5check_version aborts on any header/library mismatch. See Step 8b.
 FLEXI_HDF5="/home/tang/packages/flexi/share/GNU-MPI/HDF5/build/src/HDF5-build"
 
 MISSING_DEPS=()
@@ -340,9 +345,52 @@ print_success "libROM PIC static library built: ${BUILD_PIC_DIR}/lib/libROM.a"
 print_success "Headers installed: ${BUILD_PIC_DIR}/include"
 
 # ============================================================================
+# Step 8b: SU2 HDF5 version alignment (conditional)
+# ============================================================================
+# SU2's CGNS links the HDF5 vendored inside the SU2 build tree (libsu2hdf5.a,
+# HDF5 1.12.1, MPI-enabled), and libROM's H5 references resolve to that same
+# static code inside the SU2 binary. HDF5's H5check_version() aborts the
+# process on ANY header/library version mismatch, so the build_pic/lib/libROM.a
+# produced above (compiled against the flexi HDF5 1.12.0) would make SU2_CFD
+# abort at the first ROM sample (SAVE_LIBROM=YES): "Headers are 1.12.0,
+# library is 1.12.1". install_su2.sh performs this alignment automatically
+# during the SU2 build; here we only re-align early when an SU2 build tree
+# already exists (libROM refresh scenario).
+SU2_HOME_EFF="${SU2_HOME:-/home/tang/packages/SU2}"
+VENDORED_HDF5_A="${SU2_HOME_EFF}/build/externals/cgns/hdf5/libsu2hdf5.a"
+SU2_RECIPE="${SU2_HOME_EFF}/nemo_validation/verification/scripts/deps_rebuild_librom_vendored_hdf5.sh"
+LIBROM_ALIGNED=false
+if [ -f "${VENDORED_HDF5_A}" ] && [ -f "${SU2_RECIPE}" ]; then
+    print_info "Step 8b: SU2 vendored HDF5 found - re-aligning build_pic/lib/libROM.a"
+    if JOBS="${NPROC}" bash "${SU2_RECIPE}"; then
+        print_success "libROM.a aligned with the SU2 vendored HDF5 (1.12.1, libsu2hdf5.a)"
+        LIBROM_ALIGNED=true
+    else
+        print_error "SU2 HDF5 alignment failed - SU2 SAVE_LIBROM would abort; fix the recipe error above"
+        exit 1
+    fi
+else
+    print_warning "Step 8b: SU2 build tree (libsu2hdf5.a) not found - skipping early HDF5 alignment."
+    print_warning "Expected on a fresh machine: install_su2.sh performs the alignment automatically"
+    print_warning "during the SU2 build. Manual command:"
+    print_warning "  bash ${SU2_RECIPE}"
+fi
+
+# ============================================================================
 # Step 9: Generate environment setup script
 # ============================================================================
 print_info "Step 9: Generating environment setup script..."
+
+# HDF5 linkage flags for standalone consumers of the PIC static core. When the
+# archive is aligned with the SU2 vendored HDF5, point at that static library;
+# otherwise fall back to the flexi parallel HDF5 used in Step 8.
+if [ "${LIBROM_ALIGNED}" = true ]; then
+    STATIC_HDF5_FLAGS="-L${SU2_HOME_EFF}/build/externals/cgns/hdf5 -lsu2hdf5"
+    HDF5_NOTE="aligned with the SU2 vendored HDF5 1.12.1 (libsu2hdf5.a)"
+else
+    STATIC_HDF5_FLAGS="-Wl,-rpath,${HDF5_LIB_DIR} -L${HDF5_LIB_DIR} -lhdf5"
+    HDF5_NOTE="flexi parallel HDF5 (not aligned with SU2; re-run this script after building SU2)"
+fi
 
 cat > "$ENV_FILE" << EOF
 #!/usr/bin/env bash
@@ -388,7 +436,11 @@ export LIBROM_LDFLAGS="-Wl,-rpath,${BUILD_DIR}/lib -L${BUILD_DIR}/lib -lROM"
 # PIC static core (no MFEM). The static library needs its whole dependency
 # chain: ScaLAPACK, BLAS/LAPACK, parallel HDF5, zlib, gfortran runtime, and
 # the Fortran bindings of MPI (libROM contains Fortran sources).
-export LIBROM_STATIC_LDFLAGS="-Wl,-rpath,${HDF5_LIB_DIR} -L${BUILD_PIC_DIR}/lib -lROM -L${SCALAPACK_DIR} -lscalapack -llapack -lblas -L${HDF5_LIB_DIR} -lhdf5 -lz -ldl -lm -lgfortran -lmpi_mpifh"
+# HDF5 linkage state: ${HDF5_NOTE}
+# NOTE: keep the HDF5 flags AFTER -lROM — when aligned, libsu2hdf5.a is a
+# STATIC archive and must follow the objects that reference its symbols.
+export LIBROM_STATIC_LDFLAGS="-L${BUILD_PIC_DIR}/lib -lROM -L${SCALAPACK_DIR} -lscalapack -llapack -lblas ${STATIC_HDF5_FLAGS} -lz -ldl -lm -lgfortran -lmpi_mpifh"
+export LIBROM_HDF5_NOTE="${HDF5_NOTE}"
 
 echo "libROM environment variables set (full shared + PIC static):"
 echo "  LIBROM_DIR=\$LIBROM_DIR"

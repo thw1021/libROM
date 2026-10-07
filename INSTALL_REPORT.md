@@ -11,9 +11,10 @@
 | 安装模式 | 全功能构建（此前为 core-only 静态库） |
 | 主产物 | `build/lib/libROM.so`（共享库，含 MFEM 接口）+ `build_pic/lib/libROM.a`（PIC 静态核心，供 SU2） |
 | 新建依赖 | HYPRE 2.28.0、ParMETIS 4.0.3（PIC 重建）、MFEM 4.7 并行共享库、googletest 1.14.0 |
-| 复用依赖 | ScaLAPACK 2.2.0（已是 PIC）、flexi 并行 HDF5 1.12.0、系统 OpenBLAS |
-| 验证结果 | `ctest` 29/29 通过（含 10 个 MPI 并行测试）；双库冒烟测试通过 |
+| 复用依赖 | ScaLAPACK 2.2.0（已是 PIC）、flexi 并行 HDF5 1.12.0（build/ 共享库构建用）、系统 OpenBLAS |
+| 验证结果 | `ctest` 29/29 通过（含 10 个 MPI 并行测试）；双库冒烟测试通过；SU2 端到端 ROM 算例矩阵通过（见 §10） |
 | 关键变化 | libROM 现要求 **C++17**；MFEM/HYPRE/parmetis/metis 全链路可用；脚本幂等可重跑 |
+| SU2 对齐 | `build_pic/lib/libROM.a` 已对齐 SU2 vendor HDF5 1.12.1（libsu2hdf5.a）——H5check_version 要求同版本，见 §10 |
 
 ## 2. 环境与工具链
 
@@ -24,7 +25,7 @@
 | MPI | OpenMPI（`/usr/bin/mpicc`、`mpicxx`、`mpif90`），MPI 3.1 |
 | CMake | 3.30.5（`/usr/local/bin/cmake`，要求 ≥ 3.12） |
 | BLAS/LAPACK | 系统 OpenBLAS（`/usr/lib/x86_64-linux-gnu/libopenblas.so`，同时提供 BLAS 与 LAPACK） |
-| HDF5 | 1.12.0 **并行版**，flexi 构建：`/home/tang/packages/flexi/share/GNU-MPI/HDF5/build/src/HDF5-build` |
+| HDF5 | 1.12.0 **并行版**（flexi 构建）用于 build/ 共享库；build_pic 经 Step 8b 对齐为 SU2 vendor 1.12.1（见 §10）。flexi 路径：`/home/tang/packages/flexi/share/GNU-MPI/HDF5/build/src/HDF5-build` |
 
 > 注意：`cmake/toolchains/default-toss_4_x86_64_ib-librom-dev.cmake` 是 LLNL TOSS4 机器专用
 > （Intel MKL、BLA_VENDOR=Intel10_64lp），本机**不使用** toolchain，编译器以 `-DCMAKE_*_COMPILER` 直接传入。
@@ -169,6 +170,7 @@ make -j16 && make install
 - 用途：SU2 将 `libROM.a` 链入 Python 包装共享对象（`_pysu2.so`/`_pysu2ad.so`），
   静态库必须 PIC，否则报 `relocation R_X86_64_PC32 … recompile with -fPIC`。
 - 已用 `objdump -r` 验证：0 个 `R_X86_64_32/32S` 绝对重定位。
+- **SU2 对齐（必须）**：该库须对 SU2 vendor 的 `libsu2hdf5.a`（HDF5 1.12.1）重编——flexi 1.12.0 头文件编出的 libROM.a 在 SU2 内会因 `H5check_version` 头/库不匹配 abort（见 §10）。脚本 Step 8b 与 install_su2.sh 均自动执行。
 
 ## 6. 验证记录
 
@@ -179,6 +181,8 @@ make -j16 && make install
 | PIC 静态库冒烟测试 | 同一程序链接 `libROM.a` + ScaLAPACK/BLAS/LAPACK/HDF5/z/gfortran/`-lmpi_mpifh`，运行通过 |
 | PIC 检查 | `libROM.a` 与 `libmetis.a` 均无绝对重定位；`libHYPRE.a` 以 `-fPIC` 编译 |
 | 端到端 | `bash install_librom.sh` 完整跑通（首次运行发现并修复 HDF5 库目录 bug，见 §8.1） |
+| SU2 对齐（Step 8b） | 检测到 SU2 构建树后自动重编 libROM.a 对 vendor HDF5 1.12.1；PIC 复验通过 |
+| SU2 端到端（2026-10-07） | SU2 全新安装 + SAVE_LIBROM=YES 算例矩阵全过，ROM 开/关输出逐位一致（见 §10） |
 
 ## 7. 使用指南
 
@@ -191,7 +195,7 @@ source /home/tang/packages/libROM/librom_env.sh
 | `LIBROM_CFLAGS` | `-I…/build/include`（含 `librom.h` 等） |
 | `LIBROM_LDFLAGS` | 链接**全功能共享库**（含 MFEM 接口），自带 rpath |
 | `LIBROM_STATIC_LIB_DIR` / `LIBROM_STATIC_INCLUDE_DIR` | PIC 静态核心的库/头文件目录 |
-| `LIBROM_STATIC_LDFLAGS` | 链接 PIC 静态核心的**完整依赖链**（ScaLAPACK、lapack/blas、并行 HDF5、z、dl、m、gfortran、`mpi_mpifh`） |
+| `LIBROM_STATIC_LDFLAGS` | 链接 PIC 静态核心的**完整依赖链**（ScaLAPACK、lapack/blas、并行 HDF5、z、dl、m、gfortran、`mpi_mpifh`）；HDF5 段随对齐状态自动切换（`LIBROM_HDF5_NOTE` 注明，见 §10） |
 | `LIBROM_MFEM_CFLAGS` | 代码包含 libROM 的 MFEM 头文件（如 `mfem/PointwiseSnapshot.hpp`）时追加 |
 | `MFEM_DIR` / `HYPRE_DIR` / `SCALAPACK_DIR` | 依赖位置 |
 
@@ -235,6 +239,7 @@ mpicxx -std=c++17 solver.cpp -I${LIBROM_STATIC_INCLUDE_DIR} ${LIBROM_STATIC_LDFL
    （MKL），本机须直接传编译器变量。
 10. **BLAS 实现为 OpenBLAS**：CMake 自动发现系统 OpenBLAS（优于参考实现），
     ScaLAPACK 与之兼容；勿改 `SLmake.inc` 后混用不同 BLAS。
+11. **SU2 要求 HDF5 版本对齐**：build_pic 必须对 SU2 vendor 的 `libsu2hdf5.a`（1.12.1）编译，flexi HDF5（1.12.0）编出的 libROM.a 会让 SU2_CFD 在 SAVE_LIBROM=YES 首个样本 abort（`H5check_version` 不匹配）。详见 §10；脚本 Step 8b 与 install_su2.sh 均已自动处理。
 
 ## 9. 常用维护操作
 
@@ -255,4 +260,48 @@ ldd /home/tang/packages/libROM/build/lib/libROM.so
 ```
 
 > 注：`dependencies/` 整体被仓库根 `.gitignore` 忽略；`build/`、`build_pic/`、
-> `install_librom.sh`、`librom_env.sh`、本报告均为未跟踪文件，不影响 git 状态。
+> 注：`dependencies/`、`build/`、`build_pic/`、`librom_env.sh` 被忽略或运行时生成；`install_librom.sh` 与本报告已入库（commit 2f7dd3a）。
+
+## 10. SU2 HDF5 版本对齐（2026-10-07 补记，必读）
+
+> 依据 SU2 侧安装要求（SU2 仓库 `nemo_validation/local_tasks.md` 环境维护记录，
+> 2026-10-07 深化验证）；实施为 `install_su2.sh` 的 "libROM HDF5 对齐" 步骤与本
+> 脚本 Step 8b。
+
+**要求**：`build_pic/lib/libROM.a`（SU2 专用 PIC 静态核心）必须与 SU2 的 CGNS
+使用**同一份 HDF5**——SU2 在树内 vendor 编译静态 `libsu2hdf5.a`（HDF5 **1.12.1**，
+MPI 版，`H5_HAVE_PARALLEL=1`）。libROM 的 H5 符号在 SU2 二进制内会解析到这份静态
+代码；HDF5 的 `H5check_version()` 对**任何方向**的头/库版本不匹配都会 `abort()`。
+
+**症状**：用 flexi HDF5（1.12.0）编出的 libROM.a 链入 SU2 后，`SAVE_LIBROM=YES`
+的**首个采样点**即 SIGABRT，stderr 打印：
+
+```text
+The HDF5 header files used to compile this application do not match
+the version used by the HDF5 library to which this application is linked.
+Headers are 1.12.0, library is 1.12.1
+```
+
+注意两点迷惑性：①两个方向的错配都会炸（vendor 1.12.1 / flexi 1.12.0，反之亦然）；
+②两者 SONAME 同为 `libhdf5.so.200`。另外，在 SU2 链接行显式加 `-L…flexi… -lhdf5`
+也无效——libsu2hdf5.a 的符号定义在链接序中优先生效，libROM 的调用仍绑定到它。
+
+**处置**（两个入口等价，均自动执行）：
+1. `install_su2.sh`（推荐）：meson setup 之后先 `ninja externals/cgns/hdf5/libsu2hdf5.a`
+   构建 vendor HDF5，再调用配方脚本
+   `nemo_validation/verification/scripts/deps_rebuild_librom_vendored_hdf5.sh`
+   对 vendor 头 + 静态库重编 libROM PIC（含 PIC 复验），随后全量编译。
+   2026-10-07 已以 `rm -rf build` 全新安装实测通过。
+2. `install_librom.sh` Step 8b：检测到 SU2 构建树（libsu2hdf5.a 存在）时自动调用
+   同一配方脚本提前对齐；全新机器上跳过并告警（SU2 构建阶段会对齐）。
+   手动命令：`bash $SU2_HOME/nemo_validation/verification/scripts/deps_rebuild_librom_vendored_hdf5.sh`。
+
+**对齐后的状态**：SU2 二进制内只存在一份静态 HDF5（1.12.1），`ldd bin/SU2_CFD`
+无任何 HDF5 运行期依赖；`librom_env.sh` 的 `LIBROM_STATIC_LDFLAGS` 的 HDF5 段
+自动切换为 `-L${SU2_HOME}/build/externals/cgns/hdf5 -lsu2hdf5`（`LIBROM_HDF5_NOTE`
+注明状态）。
+
+**对齐后验证**（2026-10-07，SU2 侧实测）：thermalbath（NEMO 化学浴）+STATIC_POD
+串行（11 维基）、INCREMENTAL_POD（3 维）、np2 并行（逐 rank 产物）、QuickStart
+定常收敛分支全部通过；ROM off/static/incr 三种形态 496 行迭代屏幕输出 md5 逐位
+一致（对数值零干扰）；it200 与 SU2 串行回归登记值逐位一致。
